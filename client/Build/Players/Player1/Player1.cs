@@ -197,12 +197,78 @@ namespace PlayerControl
 
             updateCounter = 0;
             client = new SocketClient.Client(LOCALHOST, PORT);
+
+            // wait for signal
+            while (true)
+            {
+                string flagStringRecv = client.Receive(16);
+                if (!string.IsNullOrEmpty(flagStringRecv))
+                {
+                    if (flagStringRecv == "RESET")
+                    {
+                        break;
+                    }
+                }
+                System.Threading.Thread.Sleep(1);
+            }
+
+            // first observation
+            var SelfResult = getSelf();
+            var FloorsResult = getFloors();
+            var observationSpace = new RLData.ObservationSpace
+            {
+                SelfInfo = new RLData.ObservationSpace.AgentInfo
+                {
+                    CurrentLocationX = SelfResult.x,
+                    CurrentLocationY = SelfResult.y
+                },
+                FloorMap = new RLData.ObservationSpace.Map
+                {
+                    Row = FloorsResult.GetLength(0),
+                    Col = FloorsResult.GetLength(1),
+                    MapData = FloorsResult.OfType<int>().ToArray()
+                }
+            };
+            envPackage = new EnvPackage()
+            {
+                ObservationSpace = observationSpace,
+                Reward = null,
+                GameStatus = null
+            };
+
+            string jsonStringSend = JsonSerializer.Serialize(envPackage);
+            client.Send(jsonStringSend);
         }
 
         public override void Update()
         {
             try
             {
+                // wait for signal
+                while (true)
+                {
+                    string flagStringRecv = client.Receive(16);
+                    if (!string.IsNullOrEmpty(flagStringRecv))
+                    {
+                        if (flagStringRecv == "STEP")
+                        {
+                            break;
+                        }
+                    }
+                    System.Threading.Thread.Sleep(1);
+                }
+
+                // receive and apply action
+                string jsonStringRecv = client.Receive(256);
+                if (!string.IsNullOrEmpty(jsonStringRecv))
+                {
+                    var action =
+                        JsonSerializer.Deserialize<RLData.ActionSpace>(jsonStringRecv);
+                    moveTo(action.MoveX, action.MoveY);
+                    fireTo(action.FireX, action.FireY);
+                }
+
+                // send data
                 var SelfResult = getSelf();
                 var FloorsResult = getFloors();
                 var CurrentTime = getLeftTime();
@@ -240,16 +306,8 @@ namespace PlayerControl
                 string jsonStringSend = JsonSerializer.Serialize(envPackage);
                 client.Send(jsonStringSend);
 
-                string jsonStringRecv = client.Receive(256);
-                if(!string.IsNullOrEmpty(jsonStringRecv))
-                {
-                    var action = 
-                        JsonSerializer.Deserialize<RLData.ActionSpace>(jsonStringRecv);
-                    moveTo(action.MoveX, action.MoveY);
-                    fireTo(action.FireX, action.FireY);
-                }
-
                 updateCounter++;
+
             }
             catch (System.Exception ex)
             {

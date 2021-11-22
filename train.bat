@@ -2,4 +2,4 @@
 cd /D "%~dp0"
 
 :: then start the python server and the game client
-start .\server\Scripts\activate ^&^& .\train.py
+start .\server\Scripts\activate ^&^& .\server\server.py

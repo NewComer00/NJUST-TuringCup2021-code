@@ -1,35 +1,38 @@
 import os
-import socket
-import json
+import sys
+import time
 import numpy as np
 
 import tensorflow as tf
 from keras.models import load_model
-from keras.callbacks import TensorBoard
+from tensorflow.keras.callbacks import TensorBoard
 import tensorflow.keras.backend as K
 from tensorflow.keras.layers import Input, Dense, Flatten
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.applications import MobileNetV2
 
-HOST = '127.0.0.1'  # Standard loopback interface address (localhost)
+# self-defined modules to be added th PYTHONPATH
+project_root = os.path.dirname(os.path.abspath(__file__))
+utils_path = os.path.join(project_root, 'utils/')
+sys.path.append(utils_path)
+from turing_env import TuringEnv
+
+
 PORT = 11111  # Port to listen on (non-privileged ports are > 1023)
 
-RECV_BUF_MAX_SIZE = 10240  # must be larger than the size of a socket frame
-FRAME_LEN_BYTES = 4
-HEADER = b'\xaa\xaa'
-EOF = b'\xa5\xa5'
-
-ACTION_TYPE = ["MoveX", "MoveY", "FireX", "FireY"]
+game_path = r"D:\Desktop\workspace\csharp\turing2021\train-env\client\Build\TuringGame2021.exe"
+env = TuringEnv(game_path=game_path, port=PORT)
+state = env.reset()
+state_dims = env.observation_space.shape
+n_actions = env.action_space.n
 
 MAP_LABELS = np.array([-2, -1, 0, 1, 2])
 MOBILENET_IMG_SIZE = [96, 96]
-
-MAP_SHAPE = [50, 50]
 FIRE_ANGLE_MAX = 360
 FIRE_RANGE_MAX = 10
 
-print("Python Server Activated!")
+print("Training Environment Activated!")
 print("========================================")
 
 # ==================== PPO Utils ====================
@@ -113,12 +116,48 @@ def get_advantages(values, masks, rewards):
     return returns, (adv - np.mean(adv)) / (np.std(adv) + 1e-10)
 
 
+def test_reward():
+    state = env.reset()
+    done = False
+    total_reward = 0
+    print('testing...')
+    limit = 0
+    while not done:
+        # map value to 0 ~ 255
+        img_map = state.copy()
+        img_norm = (img_map - MAP_LABELS.min()) / (MAP_LABELS.ptp() + np.finfo(float).eps)
+        img_norm = np.around(img_norm * 255)
+        img_color = np.repeat(img_norm[:, :, np.newaxis], 3, axis=2)
+        state = tf.image.resize(img_color, MOBILENET_IMG_SIZE)
+
+        state_input = K.expand_dims(state, 0)
+        action = model_actor.predict(
+            [np.array([state]), np.array(dummy_n), np.array(dummy_1), np.array(dummy_1), np.array(dummy_1)],
+            steps=1)
+        action = action.squeeze()
+
+        action_move = [np.around(action[0] * state_dims[0]),
+                       np.around(action[1] * state_dims[1])]
+        action_fire = [np.around(action[2] * state_dims[0]),
+                       np.around(action[3] * state_dims[1])]
+        next_state, reward, done, _ = env.step([*action_move, *action_fire])
+        state = next_state
+        total_reward += reward
+        limit += 1
+        if limit > 20:
+            break
+    return total_reward
+
+
 # ==================== PPO Global Init ====================
 
-MAX_GAME_TURN = 10
-current_step = 0
-current_game_turn = 0
-dummy_n = np.zeros((1, 1, len(ACTION_TYPE)))
+ppo_steps = 128
+target_reached = False
+best_reward = 0
+iters = 0
+max_iters = 50
+
+dummy_n = np.zeros((1, 1, n_actions))
 dummy_1 = np.zeros((1, 1, 1))
 tensor_board = TensorBoard(log_dir='./server.log')
 
@@ -129,156 +168,92 @@ model_critic = get_model_critic(
     input_dims=(*MOBILENET_IMG_SIZE, 3))
 model_actor = get_model_actor(
     input_dims=(*MOBILENET_IMG_SIZE, 3),
-    output_dims=len(ACTION_TYPE))
+    output_dims=n_actions)
 try:
     model_actor.load_weights(ACTOR_WEIGHT_PATH)
     model_critic.load_weights(CRITIC_WEIGHT_PATH)
 except:
     print("No weight files found!")
 
-# ==================== Socket Init ====================
+while not target_reached and iters < max_iters:
+    states = []
+    actions = []
+    values = []
+    masks = []
+    rewards = []
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    s.bind((HOST, PORT))
-    s.listen()
-    conn, addr = s.accept()
-    with conn:
-        print('Connected by', addr)
-        while current_game_turn < MAX_GAME_TURN:
+    for itr in range(ppo_steps):
 
-            # ==================== Receive Game Data ====================
+        # map value to 0 ~ 255
+        img_map = state.copy()
+        img_norm = (img_map - MAP_LABELS.min()) / (MAP_LABELS.ptp() + np.finfo(float).eps)
+        img_norm = np.around(img_norm * 255)
+        img_color = np.repeat(img_norm[:, :, np.newaxis], 3, axis=2)
+        state = tf.image.resize(img_color, MOBILENET_IMG_SIZE)
 
-            recv_buf = conn.recv(RECV_BUF_MAX_SIZE)
-            if len(recv_buf) > 0:
-                recv_frame = recv_buf[recv_buf.find(HEADER):recv_buf.rfind(EOF) + len(EOF)]
-                # get the frame length info stored in the frame
-                recv_frame_len = int.from_bytes(
-                    recv_frame[len(HEADER):len(HEADER) + FRAME_LEN_BYTES],
-                    byteorder='big', signed=True)
-                # if len(frame) is zero, it means current buffer doesn't contain a valid frame
-                # if the frame length is correct and nonzero, get the payload from it
-                if len(recv_frame) == recv_frame_len and len(recv_frame) > 0:
-                    recv_payload = recv_frame[len(HEADER) + FRAME_LEN_BYTES:-len(EOF)]
+        state_input = K.expand_dims(state, 0)
+        action = model_actor.predict(
+            [np.array([state]), np.array(dummy_n), np.array(dummy_1), np.array(dummy_1), np.array(dummy_1)],
+            steps=1)
+        action = action.squeeze()
+        print(action)
+        q_value = model_critic.predict(np.array([state]), steps=1)
+        q_value = q_value.item()
+        print(q_value)
 
-                    # ==================== Append Data to PPO Lists ====================
+        action_move = [np.around(action[0] * state_dims[0]),
+                       np.around(action[1] * state_dims[1])]
+        action_fire = [np.around(action[2] * state_dims[0]),
+                       np.around(action[3] * state_dims[1])]
+        observation, reward, done, info = env.step([*action_move, *action_fire])
+        mask = not done
 
-                    if current_step == 0:
-                        states = []
-                        actions = []
-                        values = []
-                        masks = []
-                        rewards = []
+        states.append(state)
+        actions.append(action)
+        values.append(q_value)
+        masks.append(mask)
+        rewards.append(reward)
 
-                    elif current_step > 0:
-                        masks.append(mask)
-                        rewards.append(reward)
+        state = observation
+        if done:
+            break
+            # env.reset()
 
-                        # if game is over 
-                        if not mask:
-                            # ==================== Calc PPO Lost ====================
+    # map value to 0 ~ 255
+    img_map = state.copy()
+    img_norm = (img_map - MAP_LABELS.min()) / (MAP_LABELS.ptp() + np.finfo(float).eps)
+    img_norm = np.around(img_norm * 255)
+    img_color = np.repeat(img_norm[:, :, np.newaxis], 3, axis=2)
+    state = tf.image.resize(img_color, MOBILENET_IMG_SIZE)
 
-                            # print(len(states))
-                            # print(len(actions))
-                            # print(len(values))
-                            # print(len(masks))
-                            # print(len(rewards))
+    q_value = model_critic.predict(np.array([state]), steps=1)
+    q_value = q_value.item()
+    values.append(q_value)
+    returns, advantages = get_advantages(values, masks, rewards)
+    actor_loss = model_actor.fit(
+        [np.array(states),
+         np.reshape(actions, newshape=(-1, 1, n_actions)),
+         np.reshape(advantages, newshape=(-1, 1, 1)),
+         np.reshape(rewards, newshape=(-1, 1, 1)),
+         np.reshape(values[:-1], newshape=(-1, 1, 1))],
+        [np.reshape(actions, newshape=(-1, n_actions))],
+        verbose=True, shuffle=True, epochs=8,
+        callbacks=[tensor_board])
+    critic_loss = model_critic.fit(
+        [np.array(states)],
+        [np.reshape(returns, newshape=(-1, 1))], shuffle=True, epochs=8,
+        verbose=True, callbacks=[tensor_board])
 
-                            q_value = model_critic.predict(np.array([state]), steps=1)
-                            q_value = q_value.item()
-                            values.append(q_value)
-                            returns, advantages = get_advantages(values, masks, rewards)
-                            actor_loss = model_actor.fit(
-                                [np.array(states),
-                                 np.reshape(actions, newshape=(-1, 1, len(ACTION_TYPE))),
-                                 np.reshape(advantages, newshape=(-1, 1, 1)),
-                                 np.reshape(rewards, newshape=(-1, 1, 1)),
-                                 np.reshape(values[:-1], newshape=(-1, 1, 1))],
-                                [np.reshape(actions, newshape=(-1, len(ACTION_TYPE)))],
-                                verbose=True, shuffle=True, epochs=8,
-                                callbacks=[tensor_board])
-                            critic_loss = model_critic.fit(
-                                [np.array(states)],
-                                [np.reshape(returns, newshape=(-1, 1))], shuffle=True, epochs=8,
-                                verbose=True, callbacks=[tensor_board])
+    avg_reward = np.mean([test_reward() for _ in range(5)])
+    print('total test reward=' + str(avg_reward))
+    if avg_reward > best_reward:
+        print('best reward=' + str(avg_reward))
+        model_actor.save_weights(ACTOR_WEIGHT_PATH)
+        model_critic.save_weights(CRITIC_WEIGHT_PATH)
+        best_reward = avg_reward
+    if best_reward > 0.9 or iters > max_iters:
+        target_reached = True
+    iters += 1
+    state = env.reset()
 
-                            model_actor.save_weights(ACTOR_WEIGHT_PATH)
-                            model_critic.save_weights(CRITIC_WEIGHT_PATH)
-
-                            # avg_reward = np.mean([test_reward() for _ in range(5)])
-                            # print('total test reward=' + str(avg_reward))
-                            # if avg_reward > best_reward:
-                            #     print('best reward=' + str(avg_reward))
-                            #     model_actor.save('model_actor_{}_{}.hdf5'.format(iters, avg_reward))
-                            #     model_critic.save('model_critic_{}_{}.hdf5'.format(iters, avg_reward))
-                            #     best_reward = avg_reward
-
-                            current_step = 0
-                            current_game_turn += 1
-                            print("========================================")
-                            print("Game Over!")
-                            os.system('pause')
-
-                    # ==================== Process & Update Data ====================
-
-                    json_dict = json.loads(recv_payload)
-
-                    # update "state"
-                    observation_space = json_dict["ObservationSpace"]
-                    map_flatten = observation_space["FloorMap"]["MapData"]
-                    map_row = observation_space["FloorMap"]["Row"]
-                    map_col = observation_space["FloorMap"]["Col"]
-                    floor_map = np.array(map_flatten).reshape(map_row, map_col)
-                    # map value to 0 ~ 255
-                    img_map = floor_map.copy()
-                    img_norm = (img_map - MAP_LABELS.min()) / (MAP_LABELS.ptp() + np.finfo(float).eps)
-                    img_norm = np.around(img_norm * 255)
-                    img_color = np.repeat(img_norm[:, :, np.newaxis], 3, axis=2)
-                    state = tf.image.resize(img_color, MOBILENET_IMG_SIZE)
-
-                    # update "mask"
-                    game_status = json_dict["GameStatus"]
-                    mask = not game_status["GameFinished"]
-
-                    # update "reward"
-                    reward_struct = json_dict["Reward"]
-                    reward = reward_struct["Rwrd"]
-                    print(reward)
-
-                    # ==================== Generate Game Action & Criticism ====================
-
-                    action = model_actor.predict(
-                        [np.array([state]), np.array(dummy_n), np.array(dummy_1), np.array(dummy_1), np.array(dummy_1)],
-                        steps=1)
-                    action = action.squeeze()
-                    print(action)
-                    q_value = model_critic.predict(np.array([state]), steps=1)
-                    q_value = q_value.item()
-                    print(q_value)
-
-                    # ==================== Send Action to Game ====================
-
-                    action_move = [np.around(action[0] * MAP_SHAPE[0]),
-                                   np.around(action[1] * MAP_SHAPE[1])]
-                    action_fire = [np.around(action[2] * MAP_SHAPE[0]),
-                                   np.around(action[3] * MAP_SHAPE[1])]
-                    # action_fire = [np.around(action[2] * FIRE_RANGE_MAX),
-                    #     np.around(action[3] * FIRE_ANGLE_MAX)]
-
-                    action_space = {ACTION_TYPE[0]: action_move[0], ACTION_TYPE[1]: action_move[1],
-                                    ACTION_TYPE[2]: action_fire[0], ACTION_TYPE[3]: action_fire[1]}
-                    send_payload = json.dumps(action_space).encode('ascii')
-                    send_frame_len = len(HEADER) + FRAME_LEN_BYTES + len(send_payload) + len(EOF)
-                    send_frame_len_hex = int.to_bytes(
-                        send_frame_len, length=FRAME_LEN_BYTES,
-                        byteorder='big', signed=True)
-                    send_frame = HEADER + send_frame_len_hex + send_payload + EOF
-
-                    conn.send(send_frame)
-
-                    # ==================== Append Data to PPO Lists ====================
-
-                    states.append(state)
-                    actions.append(action)
-                    values.append(q_value)
-
-                    current_step += 1
+env.close()
